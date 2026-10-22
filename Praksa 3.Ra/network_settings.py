@@ -25,16 +25,30 @@ def run_powershell(script):
     return result.stdout.strip()
 
 
-def get_connected_adapters():
+def get_network_adapters():
     script = r"""
 $ErrorActionPreference = 'Stop'
-$adapters = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+$adapters = @(Get-NetAdapter | ForEach-Object {
     $adapter = $_
-    $config = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+    $interfaceIndex = $adapter.ifIndex
+    $hasInterfaceIndex = $null -ne $interfaceIndex -and
+        "$interfaceIndex" -match '^\d+$' -and
+        [int]$interfaceIndex -gt 0
+    $interfaceIndexValue = $null
+    $config = $null
+    $ipInterface = $null
+    if ($hasInterfaceIndex) {
+        $interfaceIndexValue = [int]$interfaceIndex
+        $config = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction SilentlyContinue
+        $ipInterface = Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    }
     [pscustomobject]@{
         Name = $adapter.Name
         Description = $adapter.InterfaceDescription
-        InterfaceIndex = [int]$adapter.ifIndex
+        Status = [string]$adapter.Status
+        InterfaceIndex = $interfaceIndexValue
+        IPv4Dhcp = [string]$ipInterface.Dhcp
         IPv4 = @($config.IPv4Address | ForEach-Object {
             [pscustomobject]@{ IPAddress = $_.IPAddress; PrefixLength = $_.PrefixLength }
         })
@@ -56,15 +70,30 @@ def adapter_settings(adapter):
     if isinstance(addresses, dict):
         addresses = [addresses]
     return {
-        "IP": [address.get("IPAddress", "") for address in addresses],
+        "IP": [
+            str(address["IPAddress"])
+            for address in addresses
+            if address.get("IPAddress") is not None
+        ],
         "MASK": [
             str(ipaddress.IPv4Network(f"0.0.0.0/{address['PrefixLength']}").netmask)
             for address in addresses
             if address.get("PrefixLength") is not None
         ],
-        "GATEWAY": adapter.get("Gateway") or [],
-        "DNS": adapter.get("DNS") or [],
+        "GATEWAY": [
+            str(value) for value in (adapter.get("Gateway") or []) if value is not None
+        ],
+        "DNS": [str(value) for value in (adapter.get("DNS") or []) if value is not None],
     }
+
+
+def ip_assignment_mode(adapter):
+    dhcp_status = str(adapter.get("IPv4Dhcp") or "").casefold()
+    if dhcp_status == "enabled":
+        return "DHCP"
+    if dhcp_status == "disabled":
+        return "Manual"
+    return "Unknown"
 
 
 def settings_comparison(before, after):
@@ -72,6 +101,45 @@ def settings_comparison(before, after):
         name: {"previous": before[name], "current": after[name]}
         for name in ("IP", "MASK", "GATEWAY", "DNS")
     }
+
+
+def request_admin_mode(root):
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return False
+    except (AttributeError, OSError):
+        return False
+
+    if not messagebox.askyesno(
+        "Run as administrator",
+        "Do you want to restart this program as administrator?",
+        parent=root,
+    ):
+        return False
+
+    shell_execute = ctypes.windll.shell32.ShellExecuteW
+    shell_execute.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+    )
+    shell_execute.restype = ctypes.c_void_p
+    result = shell_execute(
+        None,
+        "runas",
+        sys.executable,
+        subprocess.list2cmdline(sys.argv),
+        None,
+        1,
+    )
+    if result is None or result <= 32:
+        if result == 5:
+            return False
+        raise OSError(f"Could not start administrator mode (ShellExecuteW returned {result}).")
+    return True
 
 
 def load_presets():
@@ -126,13 +194,23 @@ def apply_static(interface_index, ip, prefix, gateway, dns_servers):
         if dns_servers
         else f"Set-DnsClientServerAddress -InterfaceIndex {interface_index} -ResetServerAddresses"
     )
+    gateway_cleanup = (
+        f"Get-NetRoute -InterfaceIndex {interface_index} -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+        f"Where-Object {{ $_.DestinationPrefix -eq '0.0.0.0/0' -or $_.NextHop -eq '{gateway}' }} | "
+        "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue"
+        if gateway
+        else (
+            f"Get-NetRoute -InterfaceIndex {interface_index} -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } | "
+            "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue"
+        )
+    )
     script = f"""
 $ErrorActionPreference = 'Stop'
 Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv4 -Dhcp Disabled
 Get-NetIPAddress -InterfaceIndex {interface_index} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-Get-NetRoute -InterfaceIndex {interface_index} -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+{gateway_cleanup}
 $settings = @{{
     InterfaceIndex = {interface_index}
     IPAddress = '{ip}'
@@ -188,16 +266,22 @@ def run_terminal():
         return
 
     try:
-        adapters = get_connected_adapters()
+        adapters = get_network_adapters()
         if not adapters:
-            print("No connected network adapters were found.")
+            print("No network adapters were found.")
             return
 
-        print("Connected network adapters:")
+        print("Network adapters:")
         for index, adapter in enumerate(adapters, start=1):
-            print(f"{index}. {adapter['Name']} ({adapter['Description']})")
+            print(
+                f"{index}. {adapter['Name']} ({adapter['Description']}) "
+                f"[{adapter['Status']}]"
+            )
             pprint.pprint(adapter_settings(adapter), sort_dicts=False)
         adapter = adapters[prompt_number("Select adapter: ", len(adapters))]
+        if adapter.get("InterfaceIndex") is None:
+            print(f"{adapter['Name']} has no interface index and cannot be configured.")
+            return
 
         print("\nSettings mode:\n1. DHCP\n2. Manual\n3. Preset")
         mode_index = prompt_number("Select mode: ", 3)
@@ -243,7 +327,7 @@ def run_terminal():
         updated_adapter = next(
             (
                 item
-                for item in get_connected_adapters()
+                for item in get_network_adapters()
                 if item["InterfaceIndex"] == adapter["InterfaceIndex"]
             ),
             None,
@@ -267,11 +351,11 @@ class NetworkSettingsApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Windows Network Settings")
-        self.root.minsize(620, 520)
+        self.root.minsize(560, 480)
         self.adapters = []
+        self.selected_adapter_index = None
         self.presets = load_presets()
 
-        self.adapter_var = tk.StringVar()
         self.mode_var = tk.StringVar(value="DHCP")
         self.preset_var = tk.StringVar()
         self.quick_host_var = tk.StringVar()
@@ -285,28 +369,44 @@ class NetworkSettingsApp:
         }
 
         self._build_ui()
+        self.root.bind_all("<Alt-r>", self._refresh_shortcut)
+        self.root.bind_all("<Alt-R>", self._refresh_shortcut)
+        self.root.bind_all("<Control-Return>", self._apply_shortcut)
+        self.root.bind_all("<Control-KP_Enter>", self._apply_shortcut)
         self.refresh_adapters()
 
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=16)
         main.pack(fill="both", expand=True)
+        main.columnconfigure(0, weight=1)
         main.columnconfigure(1, weight=1)
+        main.columnconfigure(2, weight=1)
 
-        ttk.Label(main, text="Connected network adapter").grid(row=0, column=0, sticky="w", pady=4)
-        self.adapter_box = ttk.Combobox(main, textvariable=self.adapter_var, state="readonly")
-        self.adapter_box.grid(row=0, column=1, sticky="ew", padx=(12, 8), pady=4)
-        self.adapter_box.bind("<<ComboboxSelected>>", self._show_current_settings)
-        ttk.Button(main, text="Refresh", command=self.refresh_adapters).grid(row=0, column=2, pady=4)
+        ttk.Label(main, text="Network adapters").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Button(main, text="Refresh", command=self.refresh_adapters).grid(
+            row=0, column=2, sticky="e", pady=4
+        )
+
+        adapter_list = ttk.LabelFrame(main, text="Select an adapter", padding=6)
+        adapter_list.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        self.adapter_cards_frame = ttk.Frame(adapter_list)
+        self.adapter_cards_frame.pack(fill="x")
+        ttk.Label(
+            adapter_list,
+            text="Keyboard: Tab to navigate, arrows to choose, Enter/Space to select.",
+        ).pack(anchor="w", padx=2, pady=(4, 0))
+        self.adapter_cards = []
+        self.root.bind("<Configure>", self._resize_adapter_cards)
 
         current = ttk.LabelFrame(main, text="Current settings", padding=12)
-        current.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(12, 16))
+        current.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 16))
         current.columnconfigure(1, weight=1)
         for row, (label, variable) in enumerate(self.current_vars.items()):
             ttk.Label(current, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=3)
             ttk.Label(current, textvariable=variable).grid(row=row, column=1, sticky="w", padx=(12, 0), pady=3)
 
         modes = ttk.LabelFrame(main, text="New settings", padding=12)
-        modes.grid(row=2, column=0, columnspan=3, sticky="ew")
+        modes.grid(row=3, column=0, columnspan=3, sticky="ew")
         for column in range(3):
             modes.columnconfigure(column, weight=1)
         for column, mode in enumerate(("DHCP", "Manual", "Presets")):
@@ -356,10 +456,10 @@ class NetworkSettingsApp:
         if not self._is_admin():
             self.status_var.set("Administrator rights are required to apply network changes.")
         ttk.Label(main, textvariable=self.status_var, wraplength=560).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(12, 4)
+            row=4, column=0, columnspan=3, sticky="w", pady=(12, 4)
         )
         ttk.Button(main, text="Apply settings", command=self.apply_settings).grid(
-            row=4, column=0, columnspan=3, sticky="e", pady=(8, 0)
+            row=5, column=0, columnspan=3, sticky="e", pady=(8, 0)
         )
         self._show_mode()
 
@@ -373,44 +473,147 @@ class NetworkSettingsApp:
     def refresh_adapters(self):
         previous_index = self._selected_adapter().get("InterfaceIndex")
         try:
-            self.adapters = get_connected_adapters()
+            self.adapters = get_network_adapters()
         except (OSError, RuntimeError, json.JSONDecodeError) as error:
             messagebox.showerror("Adapter refresh failed", str(error), parent=self.root)
             return False
 
-        self.adapter_box["values"] = [
-            f"{adapter['Name']} ({adapter['Description']})" for adapter in self.adapters
-        ]
-        selected = next(
+        self.selected_adapter_index = next(
             (index for index, adapter in enumerate(self.adapters) if adapter["InterfaceIndex"] == previous_index),
-            0,
+            0 if self.adapters else None,
         )
+        self._render_adapter_cards()
         if self.adapters:
-            self.adapter_box.current(selected)
             self._show_current_settings()
             self.status_var.set(
                 "Administrator rights are required to apply network changes."
                 if not self._is_admin()
-                else f"Found {len(self.adapters)} connected adapter(s)."
+                else f"Found {len(self.adapters)} network adapter(s)."
             )
         else:
-            self.adapter_var.set("")
             for variable in self.current_vars.values():
-                variable.set("No connected adapter")
-            self.status_var.set("No connected network adapters were found.")
+                variable.set("No adapter")
+            for variable in self.manual_vars.values():
+                variable.set("")
+            self.status_var.set("No network adapters were found.")
         return True
 
+    def _render_adapter_cards(self):
+        for card in self.adapter_cards_frame.winfo_children():
+            card.destroy()
+        self.adapter_cards = []
+
+        available_width = self.root.winfo_width()
+        if available_width <= 1:
+            available_width = self.root.winfo_screenwidth()
+        wraplength = max(80, (available_width - 48) // max(1, len(self.adapters)))
+
+        for index, adapter in enumerate(self.adapters):
+            settings = adapter_settings(adapter)
+            ip_addresses = ", ".join(settings["IP"]) or "No IPv4 address"
+            status = adapter.get("Status") or "Unknown"
+            is_selected = index == self.selected_adapter_index
+            if status == "Up":
+                background, active_background = {
+                    "DHCP": ("#66bb6a", "#4caf50"),
+                    "Manual": ("#c8e6c9", "#a5d6a7"),
+                }.get(ip_assignment_mode(adapter), ("#c8e6c9", "#a5d6a7"))
+            elif status == "Disconnected":
+                background, active_background = "#ffcdd2", "#ef9a9a"
+            elif status == "Not Present":
+                background, active_background = "#757575", "#616161"
+            else:
+                background, active_background = "#f2f2f2", "#e0e0e0"
+            card = tk.Button(
+                self.adapter_cards_frame,
+                text=f"{adapter['Name']}\nIP: {ip_addresses}\nStatus: {status}",
+                anchor="w",
+                justify="left",
+                wraplength=wraplength,
+                padx=4,
+                pady=2,
+                relief="solid",
+                borderwidth=2 if is_selected else 1,
+                background=background,
+                activebackground=active_background,
+                takefocus=True,
+                command=lambda selected=index: self._select_adapter(selected),
+            )
+            for key in ("<Left>", "<Right>", "<Home>", "<End>", "<Return>"):
+                card.bind(
+                    key,
+                    lambda event, selected=index: self._handle_adapter_key(event, selected),
+                )
+            card.pack(side="left", anchor="nw", padx=2, pady=2)
+            self.adapter_cards.append(card)
+
+        self.root.after_idle(self._resize_adapter_cards)
+
+    def _resize_adapter_cards(self, _event=None):
+        if not self.adapter_cards:
+            return
+        available_width = max(1, self.root.winfo_width() - 48)
+        wraplength = max(80, available_width // len(self.adapter_cards))
+        for card in self.adapter_cards:
+            card.configure(wraplength=wraplength)
+
+    def _handle_adapter_key(self, event, index):
+        if not self.adapters:
+            return "break"
+        if event.keysym == "Left":
+            index = (index - 1) % len(self.adapters)
+        elif event.keysym == "Right":
+            index = (index + 1) % len(self.adapters)
+        elif event.keysym == "Home":
+            index = 0
+        elif event.keysym == "End":
+            index = len(self.adapters) - 1
+        self._select_adapter(index)
+        self.adapter_cards[index].focus_set()
+        return "break"
+
+    def _refresh_shortcut(self, _event=None):
+        self.refresh_adapters()
+        return "break"
+
+    def _apply_shortcut(self, _event=None):
+        self.apply_settings()
+        return "break"
+
+    def _select_adapter(self, index):
+        self.selected_adapter_index = index
+        self._render_adapter_cards()
+        self._show_current_settings()
+
     def _selected_adapter(self):
-        selected = self.adapter_box.current()
-        return self.adapters[selected] if 0 <= selected < len(self.adapters) else {}
+        index = self.selected_adapter_index
+        return self.adapters[index] if index is not None and 0 <= index < len(self.adapters) else {}
+
+    def _prefill_manual_settings(self, settings):
+        values = {
+            "IP address": settings["IP"][0] if settings["IP"] else "",
+            "Subnet mask": settings["MASK"][0] if settings["MASK"] else "",
+            "Gateway": settings["GATEWAY"][0] if settings["GATEWAY"] else "",
+            "DNS 1": settings["DNS"][0] if settings["DNS"] else "",
+            "DNS 2": settings["DNS"][1] if len(settings["DNS"]) > 1 else "",
+        }
+        for name, value in values.items():
+            self.manual_vars[name].set(value)
 
     def _show_current_settings(self, _event=None):
         adapter = self._selected_adapter()
         if not adapter:
+            self._prefill_manual_settings({"IP": [], "MASK": [], "GATEWAY": [], "DNS": []})
             return
         settings = adapter_settings(adapter)
+        self._prefill_manual_settings(settings)
+        ip_assignment = ip_assignment_mode(adapter)
         values = {
-            "IP address": ", ".join(settings["IP"]) or "Not set",
+            "IP address": (
+                f"{', '.join(settings['IP'])} ({ip_assignment})"
+                if settings["IP"]
+                else f"Not set ({ip_assignment})"
+            ),
             "Subnet mask": ", ".join(settings["MASK"]) or "Not set",
             "Gateway": ", ".join(settings["GATEWAY"]) or "Not set",
             "DNS": ", ".join(settings["DNS"]) or "Not set",
@@ -464,7 +667,14 @@ class NetworkSettingsApp:
     def apply_settings(self):
         adapter = self._selected_adapter()
         if not adapter:
-            messagebox.showerror("No adapter selected", "Select a connected network adapter first.", parent=self.root)
+            messagebox.showerror("No adapter selected", "Select a network adapter first.", parent=self.root)
+            return
+        if adapter.get("InterfaceIndex") is None:
+            messagebox.showinfo(
+                "Adapter unavailable",
+                f"{adapter['Name']} has no interface index and cannot be configured.",
+                parent=self.root,
+            )
             return
         if not self._is_admin():
             messagebox.showerror(
@@ -561,6 +771,13 @@ def main():
     except tk.TclError as error:
         print(f"Could not open the graphical interface: {error}", file=sys.stderr)
         return
+
+    try:
+        if request_admin_mode(root):
+            root.destroy()
+            return
+    except OSError as error:
+        messagebox.showerror("Administrator mode unavailable", str(error), parent=root)
 
     try:
         NetworkSettingsApp(root)
