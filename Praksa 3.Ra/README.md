@@ -11,8 +11,10 @@ running Python as Administrator; applying a change can interrupt the network
 connection.
 
 Keyboard controls: use Tab to move between controls, Left/Right to move between
-adapter cards, Home/End to choose the first or last adapter, and Enter or Space
-to select a card. Use Alt+R to refresh adapters and Ctrl+Enter to apply settings.
+adapter and preset cards, and Home/End to choose the first or last card. Press
+Enter to apply settings. Use Alt+R to refresh adapters.
 
-Presets are stored in `network_presets.json` and can be edited separately. In
-the Presets mode, change the IP last number before applying the selected preset.
+IP assignment and DNS assignment can be configured independently. Manual IP
+settings have separate address, subnet mask, and gateway fields; manual DNS
+settings have separate preferred and alternative server fields. Presets are
+stored in `network_presets.json`; selecting one fills the manual fields.

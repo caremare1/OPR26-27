@@ -3,8 +3,10 @@ import ctypes
 import ipaddress
 import json
 import pprint
+import queue
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -28,32 +30,55 @@ def run_powershell(script):
 def get_network_adapters():
     script = r"""
 $ErrorActionPreference = 'Stop'
-$adapters = @(Get-NetAdapter | ForEach-Object {
+$adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Not Present' } | ForEach-Object {
     $adapter = $_
     $interfaceIndex = $adapter.ifIndex
-    $hasInterfaceIndex = $null -ne $interfaceIndex -and
-        "$interfaceIndex" -match '^\d+$' -and
-        [int]$interfaceIndex -gt 0
-    $interfaceIndexValue = $null
     $config = $null
     $ipInterface = $null
-    if ($hasInterfaceIndex) {
-        $interfaceIndexValue = [int]$interfaceIndex
-        $config = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction SilentlyContinue
-        $ipInterface = Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+
+    if ($null -ne $interfaceIndex -and "$interfaceIndex" -match '^\d+$' -and [int]$interfaceIndex -gt 0) {
+        try {
+            $config = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction Stop
+        } catch {
+            $config = $null
+        }
+
+        try {
+            $ipInterface = Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction Stop |
+                Select-Object -First 1
+        } catch {
+            $ipInterface = $null
+        }
     }
+
+    $dhcpValue = if ($ipInterface) { [string]$ipInterface.Dhcp } else { 'Unknown' }
+
     [pscustomobject]@{
         Name = $adapter.Name
         Description = $adapter.InterfaceDescription
         Status = [string]$adapter.Status
-        InterfaceIndex = $interfaceIndexValue
-        IPv4Dhcp = [string]$ipInterface.Dhcp
-        IPv4 = @($config.IPv4Address | ForEach-Object {
-            [pscustomobject]@{ IPAddress = $_.IPAddress; PrefixLength = $_.PrefixLength }
-        })
-        Gateway = @($config.IPv4DefaultGateway | ForEach-Object { $_.NextHop })
-        DNS = @($config.DnsServer.ServerAddresses | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+        InterfaceIndex = [int]$interfaceIndex
+        IPv4Dhcp = $dhcpValue
+        IPv4 = @(
+            if ($config -and $config.IPv4Address) {
+                $config.IPv4Address | ForEach-Object {
+                    [pscustomobject]@{
+                        IPAddress = $_.IPAddress
+                        PrefixLength = $_.PrefixLength
+                    }
+                }
+            }
+        )
+        Gateway = @(
+            if ($config -and $config.IPv4DefaultGateway) {
+                $config.IPv4DefaultGateway | ForEach-Object { $_.NextHop }
+            }
+        )
+        DNS = @(
+            if ($config -and $config.DnsServer -and $config.DnsServer.ServerAddresses) {
+                $config.DnsServer.ServerAddresses | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }
+            }
+        )
     }
 })
 ConvertTo-Json -InputObject $adapters -Depth 5 -Compress
@@ -147,6 +172,11 @@ def load_presets():
         presets = json.load(preset_file)
     if not isinstance(presets, list) or not presets:
         raise ValueError("The presets file must contain a non-empty list.")
+    for index, preset in enumerate(presets, start=1):
+        if not isinstance(preset, dict):
+            raise ValueError(f"Preset {index} must be an object.")
+        name = preset.get("name")
+        preset["name"] = name.strip() if isinstance(name, str) else ""
     return presets
 
 
@@ -176,11 +206,22 @@ def preset_settings(preset, host):
     return ip, preset["mask"], preset.get("gateway", ""), preset.get("dns", [])
 
 
-def apply_dhcp(interface_index):
+def apply_dhcp(interface_index, dns_servers=None):
+    if dns_servers:
+        dns_list = ", ".join(f"'{server}'" for server in dns_servers)
+        dns_command = (
+            f"Set-DnsClientServerAddress -InterfaceIndex {interface_index} "
+            f"-ServerAddresses @({dns_list})"
+        )
+    else:
+        dns_command = (
+            f"Set-DnsClientServerAddress -InterfaceIndex {interface_index} "
+            "-ResetServerAddresses"
+        )
     script = f"""
 $ErrorActionPreference = 'Stop'
 Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv4 -Dhcp Enabled
-Set-DnsClientServerAddress -InterfaceIndex {interface_index} -ResetServerAddresses
+{dns_command}
 Write-Output 'Network settings updated.'
 """
     run_powershell(script)
@@ -256,7 +297,10 @@ def prompt_manual_settings():
         except ValueError as error:
             print(error)
     gateway = prompt_ip("Gateway", optional=True)
-    dns_servers = [prompt_ip("DNS 1", optional=True), prompt_ip("DNS 2", optional=True)]
+    dns_servers = [
+        prompt_ip("Preferred DNS server", optional=True),
+        prompt_ip("Alternative DNS server", optional=True),
+    ]
     return ip, mask, gateway, [server for server in dns_servers if server]
 
 
@@ -294,7 +338,7 @@ def run_terminal():
             presets = load_presets()
             print("Available presets:")
             for index, preset in enumerate(presets, start=1):
-                print(f"{index}. {preset['name']} ({preset['ip']})")
+                print(f"{index}. ({preset['ip']})")
             preset = presets[prompt_number("Select preset: ", len(presets))]
             default_host = str(ipaddress.IPv4Address(preset["ip"])).split(".")[-1]
             while True:
@@ -351,28 +395,37 @@ class NetworkSettingsApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Windows Network Settings")
-        self.root.minsize(560, 480)
+        self.root.minsize(760, 480)
         self.adapters = []
         self.selected_adapter_index = None
+        self.adapter_cards = []
+        self.preset_cards = []
+        self.background_results = queue.Queue()
+        self.background_busy = False
         self.presets = load_presets()
 
-        self.mode_var = tk.StringVar(value="DHCP")
+        self.ip_mode_var = tk.StringVar(value="Automatic")
+        self.dns_mode_var = tk.StringVar(value="Automatic")
         self.preset_var = tk.StringVar()
-        self.quick_host_var = tk.StringVar()
         self.current_vars = {
             name: tk.StringVar(value="Not available")
             for name in ("IP address", "Subnet mask", "Gateway", "DNS")
         }
         self.manual_vars = {
             name: tk.StringVar()
-            for name in ("IP address", "Subnet mask", "Gateway", "DNS 1", "DNS 2")
+            for name in (
+                "IP address",
+                "Subnet mask",
+                "Gateway",
+                "Preferred DNS server",
+                "Alternative DNS server",
+            )
         }
 
         self._build_ui()
+        self._bind_apply_enter(self.root)
         self.root.bind_all("<Alt-r>", self._refresh_shortcut)
         self.root.bind_all("<Alt-R>", self._refresh_shortcut)
-        self.root.bind_all("<Control-Return>", self._apply_shortcut)
-        self.root.bind_all("<Control-KP_Enter>", self._apply_shortcut)
         self.refresh_adapters()
 
     def _build_ui(self):
@@ -383,7 +436,8 @@ class NetworkSettingsApp:
         main.columnconfigure(2, weight=1)
 
         ttk.Label(main, text="Network adapters").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Button(main, text="Refresh", command=self.refresh_adapters).grid(
+        self.refresh_button = ttk.Button(main, text="Refresh", command=self.refresh_adapters)
+        self.refresh_button.grid(
             row=0, column=2, sticky="e", pady=4
         )
 
@@ -391,10 +445,6 @@ class NetworkSettingsApp:
         adapter_list.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.adapter_cards_frame = ttk.Frame(adapter_list)
         self.adapter_cards_frame.pack(fill="x")
-        ttk.Label(
-            adapter_list,
-            text="Keyboard: Tab to navigate, arrows to choose, Enter/Space to select.",
-        ).pack(anchor="w", padx=2, pady=(4, 0))
         self.adapter_cards = []
         self.root.bind("<Configure>", self._resize_adapter_cards)
 
@@ -406,62 +456,86 @@ class NetworkSettingsApp:
             ttk.Label(current, textvariable=variable).grid(row=row, column=1, sticky="w", padx=(12, 0), pady=3)
 
         modes = ttk.LabelFrame(main, text="New settings", padding=12)
-        modes.grid(row=3, column=0, columnspan=3, sticky="ew")
-        for column in range(3):
-            modes.columnconfigure(column, weight=1)
-        for column, mode in enumerate(("DHCP", "Manual", "Presets")):
-            ttk.Radiobutton(
-                modes,
-                text=mode,
-                value=mode,
-                variable=self.mode_var,
-                command=self._show_mode,
-            ).grid(row=0, column=column, sticky="w", pady=(0, 10))
+        modes.grid(row=4, column=0, columnspan=3, sticky="ew")
+        modes.columnconfigure(0, weight=1)
+        modes.columnconfigure(1, weight=1)
 
-        self.manual_frame = ttk.Frame(modes)
-        self.manual_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
-        self.manual_frame.columnconfigure(1, weight=1)
-        for row, (label, variable) in enumerate(self.manual_vars.items()):
-            ttk.Label(self.manual_frame, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=3)
-            ttk.Entry(self.manual_frame, textvariable=variable).grid(
-                row=row, column=1, sticky="ew", padx=(12, 0), pady=3
+        ip_frame = ttk.LabelFrame(modes, text="IP address", padding=8)
+        ip_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        ip_frame.columnconfigure(1, weight=1)
+        for row, (text, value) in enumerate(
+            (
+                ("Obtain an IP address automatically", "Automatic"),
+                ("Use the following IP address", "Manual"),
             )
+        ):
+            ttk.Radiobutton(
+                ip_frame,
+                text=text,
+                value=value,
+                variable=self.ip_mode_var,
+                command=self._show_ip_mode,
+            ).grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
 
-        self.preset_frame = ttk.Frame(modes)
-        self.preset_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
-        self.preset_frame.columnconfigure(1, weight=1)
-        self.preset_box = ttk.Combobox(
-            self.preset_frame,
-            textvariable=self.preset_var,
-            state="readonly",
-            values=[preset["name"] for preset in self.presets],
-        )
-        self.preset_box.grid(row=0, column=0, columnspan=2, sticky="ew", pady=4)
-        self.preset_box.bind("<<ComboboxSelected>>", self._select_preset)
-        ttk.Label(self.preset_frame, text="IP last number:").grid(row=1, column=0, sticky="w", pady=4)
-        self.quick_host = tk.Spinbox(
-            self.preset_frame,
-            from_=2,
-            to=254,
-            textvariable=self.quick_host_var,
-            width=8,
-            command=self._update_preset_summary,
-        )
-        self.quick_host.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=4)
-        self.quick_host_var.trace_add("write", self._update_preset_summary)
-        self.preset_summary = ttk.Label(self.preset_frame, text="")
-        self.preset_summary.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.ip_entries = []
+        for row, label in enumerate(("IP address", "Subnet mask", "Gateway"), start=2):
+            ttk.Label(ip_frame, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=3)
+            entry = ttk.Entry(ip_frame, textvariable=self.manual_vars[label])
+            entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=3)
+            self.ip_entries.append(entry)
+
+        dns_frame = ttk.LabelFrame(modes, text="DNS server addresses", padding=8)
+        dns_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        dns_frame.columnconfigure(1, weight=1)
+        for row, (text, value) in enumerate(
+            (
+                ("Obtain DNS server address automatically", "Automatic"),
+                ("Use the following DNS server addresses", "Manual"),
+            )
+        ):
+            ttk.Radiobutton(
+                dns_frame,
+                text=text,
+                value=value,
+                variable=self.dns_mode_var,
+                command=self._show_dns_mode,
+            ).grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+
+        self.dns_entries = []
+        for row, label in enumerate(
+            ("Preferred DNS server", "Alternative DNS server"), start=2
+        ):
+            ttk.Label(dns_frame, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=3)
+            entry = ttk.Entry(dns_frame, textvariable=self.manual_vars[label])
+            entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=3)
+            self.dns_entries.append(entry)
+
+        self.preset_frame = ttk.LabelFrame(main, text="Fill from preset", padding=8)
+        self.preset_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.preset_frame.columnconfigure(0, weight=1)
+        self.preset_cards_frame = ttk.Frame(self.preset_frame)
+        self.preset_cards_frame.grid(row=0, column=0, sticky="ew", pady=4)
+        self.preset_cards = []
+        self._render_preset_cards()
 
         self.status_var = tk.StringVar()
         if not self._is_admin():
             self.status_var.set("Administrator rights are required to apply network changes.")
         ttk.Label(main, textvariable=self.status_var, wraplength=560).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(12, 4)
+            row=5, column=0, columnspan=3, sticky="w", pady=(12, 4)
         )
-        ttk.Button(main, text="Apply settings", command=self.apply_settings).grid(
-            row=5, column=0, columnspan=3, sticky="e", pady=(8, 0)
+        self.apply_button = ttk.Button(main, text="Apply settings", command=self.apply_settings)
+        self.apply_button.grid(
+            row=6, column=0, columnspan=3, sticky="e", pady=(8, 0)
         )
-        self._show_mode()
+        self._show_ip_mode()
+        self._show_dns_mode()
+
+    def _bind_apply_enter(self, widget):
+        widget.bind("<Return>", self._apply_shortcut)
+        widget.bind("<KP_Enter>", self._apply_shortcut)
+        for child in widget.winfo_children():
+            self._bind_apply_enter(child)
 
     @staticmethod
     def _is_admin():
@@ -470,14 +544,58 @@ class NetworkSettingsApp:
         except (AttributeError, OSError):
             return False
 
-    def refresh_adapters(self):
-        previous_index = self._selected_adapter().get("InterfaceIndex")
-        try:
-            self.adapters = get_network_adapters()
-        except (OSError, RuntimeError, json.JSONDecodeError) as error:
-            messagebox.showerror("Adapter refresh failed", str(error), parent=self.root)
+    def _start_background_task(self, operation, on_success, status, error_title):
+        if self.background_busy:
             return False
+        self.background_busy = True
+        self.refresh_button.configure(state="disabled")
+        self.apply_button.configure(state="disabled")
+        self.status_var.set(status)
 
+        def run():
+            try:
+                result = operation()
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+                self.background_results.put((None, error, on_success, error_title))
+            else:
+                self.background_results.put((result, None, on_success, error_title))
+
+        threading.Thread(target=run, daemon=True).start()
+        self.root.after(50, self._poll_background_task)
+        return True
+
+    def _poll_background_task(self):
+        try:
+            result, error, on_success, error_title = self.background_results.get_nowait()
+        except queue.Empty:
+            self.root.after(50, self._poll_background_task)
+            return
+
+        self.background_busy = False
+        self.refresh_button.configure(state="normal")
+        self.apply_button.configure(state="normal")
+        if error is not None:
+            self.status_var.set(f"{error_title}: {error}")
+            messagebox.showerror(error_title, str(error), parent=self.root)
+            return
+        on_success(result)
+
+    def refresh_adapters(self):
+        if self.background_busy:
+            return False
+        previous_index = self._selected_adapter().get("InterfaceIndex")
+        return self._start_background_task(
+            lambda: sorted(
+                get_network_adapters(),
+                key=lambda adapter: adapter.get("Status") != "Up",
+            ),
+            lambda adapters: self._show_adapters(adapters, previous_index),
+            "Refreshing adapters...",
+            "Adapter refresh failed",
+        )
+
+    def _show_adapters(self, adapters, previous_index=None):
+        self.adapters = adapters
         self.selected_adapter_index = next(
             (index for index, adapter in enumerate(self.adapters) if adapter["InterfaceIndex"] == previous_index),
             0 if self.adapters else None,
@@ -488,7 +606,7 @@ class NetworkSettingsApp:
             self.status_var.set(
                 "Administrator rights are required to apply network changes."
                 if not self._is_admin()
-                else f"Found {len(self.adapters)} network adapter(s)."
+                else ""
             )
         else:
             for variable in self.current_vars.values():
@@ -496,7 +614,6 @@ class NetworkSettingsApp:
             for variable in self.manual_vars.values():
                 variable.set("")
             self.status_var.set("No network adapters were found.")
-        return True
 
     def _render_adapter_cards(self):
         for card in self.adapter_cards_frame.winfo_children():
@@ -539,23 +656,29 @@ class NetworkSettingsApp:
                 takefocus=True,
                 command=lambda selected=index: self._select_adapter(selected),
             )
-            for key in ("<Left>", "<Right>", "<Home>", "<End>", "<Return>"):
+            for key in ("<Left>", "<Right>", "<Home>", "<End>"):
                 card.bind(
                     key,
                     lambda event, selected=index: self._handle_adapter_key(event, selected),
                 )
+            self._bind_apply_enter(card)
+            card.bind("<space>", lambda _event: "break")
             card.pack(side="left", anchor="nw", padx=2, pady=2)
             self.adapter_cards.append(card)
 
         self.root.after_idle(self._resize_adapter_cards)
 
     def _resize_adapter_cards(self, _event=None):
-        if not self.adapter_cards:
-            return
         available_width = max(1, self.root.winfo_width() - 48)
-        wraplength = max(80, available_width // len(self.adapter_cards))
-        for card in self.adapter_cards:
-            card.configure(wraplength=wraplength)
+        for cards in (
+            getattr(self, "adapter_cards", []),
+            getattr(self, "preset_cards", []),
+        ):
+            if not cards:
+                continue
+            wraplength = max(80, available_width // len(cards))
+            for card in cards:
+                card.configure(wraplength=wraplength)
 
     def _handle_adapter_key(self, event, index):
         if not self.adapters:
@@ -594,8 +717,8 @@ class NetworkSettingsApp:
             "IP address": settings["IP"][0] if settings["IP"] else "",
             "Subnet mask": settings["MASK"][0] if settings["MASK"] else "",
             "Gateway": settings["GATEWAY"][0] if settings["GATEWAY"] else "",
-            "DNS 1": settings["DNS"][0] if settings["DNS"] else "",
-            "DNS 2": settings["DNS"][1] if len(settings["DNS"]) > 1 else "",
+            "Preferred DNS server": settings["DNS"][0] if settings["DNS"] else "",
+            "Alternative DNS server": settings["DNS"][1] if len(settings["DNS"]) > 1 else "",
         }
         for name, value in values.items():
             self.manual_vars[name].set(value)
@@ -621,50 +744,119 @@ class NetworkSettingsApp:
         for name, value in values.items():
             self.current_vars[name].set(value)
 
-    def _show_mode(self):
-        self.manual_frame.grid_remove()
-        self.preset_frame.grid_remove()
-        if self.mode_var.get() == "Manual":
-            self.manual_frame.grid()
-        elif self.mode_var.get() == "Presets":
-            self.preset_frame.grid()
-            if self.presets and not self.preset_var.get():
-                self.preset_box.current(0)
-                self._select_preset()
+    def _show_ip_mode(self):
+        state = "normal" if self.ip_mode_var.get() == "Manual" else "disabled"
+        for entry in self.ip_entries:
+            entry.configure(state=state)
+
+    def _show_dns_mode(self):
+        state = "normal" if self.dns_mode_var.get() == "Manual" else "disabled"
+        for entry in self.dns_entries:
+            entry.configure(state=state)
 
     def _select_preset(self, _event=None):
         preset = self._selected_preset()
         if not preset:
             return
-        address = ipaddress.IPv4Address(preset["ip"])
-        self.quick_host_var.set(str(address).split(".")[-1])
-        self._update_preset_summary()
+        try:
+            settings = preset_settings(preset, str(ipaddress.IPv4Address(preset["ip"])).split(".")[-1])
+        except (KeyError, ValueError) as error:
+            messagebox.showerror("Invalid preset", str(error), parent=self.root)
+            return
+        self._prefill_manual_settings(
+            {
+                "IP": [settings[0]],
+                "MASK": [settings[1]],
+                "GATEWAY": [settings[2]] if settings[2] else [],
+                "DNS": settings[3],
+            }
+        )
+        self._render_preset_cards()
+        self.ip_mode_var.set("Manual")
+        self.dns_mode_var.set("Manual")
+        self._show_ip_mode()
+        self._show_dns_mode()
+        self.ip_entries[0].focus_set()
+        self.ip_entries[0].selection_range(0, tk.END)
 
     def _selected_preset(self):
-        return next((preset for preset in self.presets if preset["name"] == self.preset_var.get()), None)
-
-    def _update_preset_summary(self, *_args):
-        preset = self._selected_preset()
-        if not preset:
-            return
         try:
-            host = int(self.quick_host_var.get())
-            address = ipaddress.IPv4Address(preset["ip"])
-            ip = str(ipaddress.IPv4Address((int(address) & 0xFFFFFF00) | host))
-        except (ValueError, ipaddress.AddressValueError):
-            self.preset_summary.configure(text="Enter a host number from 2 to 254.")
-            return
-        self.preset_summary.configure(
-            text=f"IP: {ip}    Mask: {preset['mask']}    Gateway: {preset.get('gateway', 'None')}"
-        )
+            index = int(self.preset_var.get())
+        except (TypeError, ValueError):
+            return None
+        return self.presets[index] if 0 <= index < len(self.presets) else None
 
-    def _settings_from_preset(self):
-        preset = self._selected_preset()
-        if not preset:
-            raise ValueError("Choose a preset first.")
-        return preset_settings(preset, self.quick_host_var.get())
+    def _render_preset_cards(self):
+        for card in self.preset_cards_frame.winfo_children():
+            card.destroy()
+        self.preset_cards = []
+
+        available_width = self.root.winfo_width()
+        if available_width <= 1:
+            available_width = self.root.winfo_screenwidth()
+        wraplength = max(80, (available_width - 48) // max(1, len(self.presets)))
+
+        for index, preset in enumerate(self.presets):
+            selected = str(index) == self.preset_var.get()
+            try:
+                ip = str(ipaddress.IPv4Address(preset["ip"]))
+            except (KeyError, ipaddress.AddressValueError):
+                ip = str(preset.get("ip", "Unknown"))
+            gateway = preset.get("gateway") or "None"
+            dns_servers = ", ".join(preset.get("dns", [])) or "Automatic"
+            card = tk.Button(
+                self.preset_cards_frame,
+                text=(
+                    f"IP: {ip}\n"
+                    f"Mask: {preset.get('mask', 'Unknown')}\n"
+                    f"Gateway: {gateway}\nDNS: {dns_servers}"
+                ),
+                anchor="w",
+                justify="left",
+                wraplength=wraplength,
+                padx=4,
+                pady=2,
+                relief="solid",
+                borderwidth=2 if selected else 1,
+                background="#c8e6c9" if selected else "#f2f2f2",
+                activebackground="#a5d6a7" if selected else "#e0e0e0",
+                takefocus=True,
+                command=lambda selected_index=index: self._select_preset_card(selected_index),
+            )
+            for key in ("<Left>", "<Right>", "<Home>", "<End>"):
+                card.bind(
+                    key,
+                    lambda event, selected_index=index: self._handle_preset_key(
+                        event, selected_index
+                    ),
+                )
+            self._bind_apply_enter(card)
+            card.pack(side="left", anchor="nw", padx=2, pady=2)
+            self.preset_cards.append(card)
+        self.root.after_idle(self._resize_adapter_cards)
+
+    def _select_preset_card(self, index):
+        self.preset_var.set(str(index))
+        self._select_preset()
+
+    def _handle_preset_key(self, event, index):
+        if not self.presets:
+            return "break"
+        if event.keysym == "Left":
+            index = (index - 1) % len(self.presets)
+        elif event.keysym == "Right":
+            index = (index + 1) % len(self.presets)
+        elif event.keysym == "Home":
+            index = 0
+        elif event.keysym == "End":
+            index = len(self.presets) - 1
+        self._select_preset_card(index)
+        self.preset_cards[index].focus_set()
+        return "break"
 
     def apply_settings(self):
+        if self.background_busy:
+            return
         adapter = self._selected_adapter()
         if not adapter:
             messagebox.showerror("No adapter selected", "Select a network adapter first.", parent=self.root)
@@ -684,66 +876,82 @@ class NetworkSettingsApp:
             )
             return
         try:
-            if self.mode_var.get() == "DHCP":
-                settings = None
-            elif self.mode_var.get() == "Manual":
-                settings = (
-                    self.manual_vars["IP address"].get(),
-                    self.manual_vars["Subnet mask"].get(),
-                    self.manual_vars["Gateway"].get(),
-                    [self.manual_vars["DNS 1"].get(), self.manual_vars["DNS 2"].get()],
-                )
-            else:
-                settings = self._settings_from_preset()
+            if self.ip_mode_var.get() == "Manual":
+                ip = validate_ip(self.manual_vars["IP address"].get(), "IP address")
+                prefix = subnet_prefix(self.manual_vars["Subnet mask"].get())
+                gateway_value = self.manual_vars["Gateway"].get().strip()
+                gateway = validate_ip(gateway_value, "Gateway") if gateway_value else ""
 
-            if settings is not None:
-                ip = validate_ip(settings[0], "IP address")
-                prefix = subnet_prefix(settings[1])
-                gateway = validate_ip(settings[2], "Gateway") if settings[2].strip() else ""
-                dns_servers = [validate_ip(server, "DNS server") for server in settings[3] if server.strip()]
+            dns_servers = []
+            if self.dns_mode_var.get() == "Manual":
+                preferred_dns = self.manual_vars["Preferred DNS server"].get().strip()
+                if not preferred_dns:
+                    raise ValueError("Preferred DNS server is required when DNS is manual.")
+                dns_servers.append(validate_ip(preferred_dns, "Preferred DNS server"))
+                alternative_dns = self.manual_vars["Alternative DNS server"].get().strip()
+                if alternative_dns:
+                    dns_servers.append(validate_ip(alternative_dns, "Alternative DNS server"))
         except (ValueError, KeyError) as error:
             messagebox.showerror("Invalid settings", str(error), parent=self.root)
             return
 
-        mode = self.mode_var.get()
+        ip_mode = self.ip_mode_var.get()
+        dns_mode = self.dns_mode_var.get()
         if not messagebox.askyesno(
             "Apply network settings",
-            f"Apply {mode} settings to {adapter['Name']}?\n\nThe network connection may be interrupted.",
+            f"Apply {ip_mode.lower()} IP and {dns_mode.lower()} DNS settings to {adapter['Name']}?"
+            "\n\nThe network connection may be interrupted.",
             parent=self.root,
         ):
             return
 
         previous_settings = adapter_settings(adapter)
-        try:
-            if settings is None:
-                apply_dhcp(adapter["InterfaceIndex"])
+        interface_index = adapter["InterfaceIndex"]
+
+        def apply_and_read_adapters():
+            if ip_mode == "Automatic":
+                apply_dhcp(interface_index, dns_servers if dns_mode == "Manual" else None)
             else:
-                apply_static(adapter["InterfaceIndex"], ip, prefix, gateway, dns_servers)
-        except (OSError, RuntimeError) as error:
-            messagebox.showerror("Could not apply settings", str(error), parent=self.root)
-            return
+                apply_static(
+                    interface_index,
+                    ip,
+                    prefix,
+                    gateway,
+                    dns_servers if dns_mode == "Manual" else [],
+                )
+            return sorted(
+                get_network_adapters(),
+                key=lambda item: item.get("Status") != "Up",
+            )
 
-        if not self.refresh_adapters():
-            print(f"Settings applied to {adapter['Name']}, but updated settings could not be read.")
-            return
+        def show_result(updated_adapters):
+            self._show_adapters(updated_adapters, interface_index)
+            updated_adapter = next(
+                (
+                    item
+                    for item in self.adapters
+                    if item["InterfaceIndex"] == interface_index
+                ),
+                None,
+            )
+            if updated_adapter is None:
+                print(
+                    f"Settings applied to {adapter['Name']}, but the adapter is no longer connected."
+                )
+                return
 
-        updated_adapter = next(
-            (
-                item
-                for item in self.adapters
-                if item["InterfaceIndex"] == adapter["InterfaceIndex"]
-            ),
-            None,
-        )
-        if updated_adapter is None:
-            print(f"Settings applied to {adapter['Name']}, but the adapter is no longer connected.")
-            return
+            current_settings = adapter_settings(updated_adapter)
+            print(f"Network settings for {adapter['Name']}:", flush=True)
+            pprint.pprint(
+                settings_comparison(previous_settings, current_settings),
+                sort_dicts=False,
+            )
 
-        current_settings = adapter_settings(updated_adapter)
-        print(f"Network settings for {adapter['Name']}:", flush=True)
-        pprint.pprint(
-            settings_comparison(previous_settings, current_settings),
-            sort_dicts=False,
+        self._start_background_task(
+            apply_and_read_adapters,
+            show_result,
+            "Applying network settings...",
+            "Could not apply settings",
         )
 
 
