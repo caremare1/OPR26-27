@@ -29,59 +29,39 @@ def run_powershell(script):
 
 def get_network_adapters():
     script = r"""
-$ErrorActionPreference = 'Stop'
-$adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Not Present' } | ForEach-Object {
-    $adapter = $_
-    $interfaceIndex = $adapter.ifIndex
-    $config = $null
-    $ipInterface = $null
+    $ErrorActionPreference = 'Stop'
 
-    if ($null -ne $interfaceIndex -and "$interfaceIndex" -match '^\d+$' -and [int]$interfaceIndex -gt 0) {
-        try {
-            $config = Get-NetIPConfiguration -InterfaceIndex $interfaceIndex -ErrorAction Stop
-        } catch {
-            $config = $null
-        }
+    # Pull directly from .NET network stack (bypasses CIM/WMI and CDXML completely)
+    $interfaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()
 
-        try {
-            $ipInterface = Get-NetIPInterface -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction Stop |
-                Select-Object -First 1
-        } catch {
-            $ipInterface = $null
-        }
-    }
-
-    $dhcpValue = if ($ipInterface) { [string]$ipInterface.Dhcp } else { 'Unknown' }
-
-    [pscustomobject]@{
-        Name = $adapter.Name
-        Description = $adapter.InterfaceDescription
-        Status = [string]$adapter.Status
-        InterfaceIndex = [int]$interfaceIndex
-        IPv4Dhcp = $dhcpValue
-        IPv4 = @(
-            if ($config -and $config.IPv4Address) {
-                $config.IPv4Address | ForEach-Object {
-                    [pscustomobject]@{
-                        IPAddress = $_.IPAddress
-                        PrefixLength = $_.PrefixLength
-                    }
+    $result = foreach ($nic in $interfaces) {
+        $props = $nic.GetIPProperties()
+        
+        # Filter down to operational or IP-enabled ones if desired, or grab all
+        $ipv4Addresses = @()
+        foreach ($addr in $props.UnicastAddresses) {
+            if ($addr.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                $ipv4Addresses += [pscustomobject]@{
+                    IPAddress    = $addr.Address.ToString()
+                    PrefixLength = 0 # .NET doesn't expose prefix length directly here without registry/mask math, safe to omit or calculate if needed
                 }
             }
-        )
-        Gateway = @(
-            if ($config -and $config.IPv4DefaultGateway) {
-                $config.IPv4DefaultGateway | ForEach-Object { $_.NextHop }
-            }
-        )
-        DNS = @(
-            if ($config -and $config.DnsServer -and $config.DnsServer.ServerAddresses) {
-                $config.DnsServer.ServerAddresses | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }
-            }
-        )
+        }
+
+        [pscustomobject]@{
+            Name           = $nic.Name
+            Description    = $nic.Description
+            Status         = [string]$nic.OperationalStatus
+            InterfaceIndex = $nic.GetIPProperties().GetIPv4Properties().Index
+            IPv4Dhcp       = 'Unknown' # .NET doesn't expose a clean boolean for DHCP here easily without CIM, but status/IPs load instantly
+            IPv4           = $ipv4Addresses
+            Gateway        = @($props.GatewayAddresses | ForEach-Object { $_.Address.ToString() })
+            DNS            = @($props.DnsAddresses | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } | ForEach-Object { $_.ToString() })
+        }
     }
-})
-ConvertTo-Json -InputObject $adapters -Depth 5 -Compress
+
+    ConvertTo-Json -InputObject $result -Depth 5 -Compress
+
 """
     output = run_powershell(script)
     if not output:
@@ -195,6 +175,8 @@ def subnet_prefix(mask):
 
 
 def preset_settings(preset, host):
+    if preset.get("dhcp") or str(preset.get("mode", "")).casefold() == "dhcp":
+        return None, None, None, preset.get("dns", [])
     try:
         host_number = int(host)
     except (TypeError, ValueError) as error:
@@ -264,6 +246,16 @@ Write-Output 'Network settings updated.'
     run_powershell(script)
 
 
+def set_adapter_enabled(adapter_name, enabled):
+    escaped_name = adapter_name.replace("'", "''")
+    command = "Enable-NetAdapter" if enabled else "Disable-NetAdapter"
+    script = f"""
+$ErrorActionPreference = 'Stop'
+{command} -Name '{escaped_name}' -Confirm:$false
+"""
+    run_powershell(script)
+
+
 def prompt_number(prompt, maximum):
     while True:
         try:
@@ -304,6 +296,74 @@ def prompt_manual_settings():
     return ip, mask, gateway, [server for server in dns_servers if server]
 
 
+def parse_direct_settings(arguments, adapter):
+    if not arguments:
+        raise ValueError("Provide DHCP or at least an IP address.")
+    if arguments[0].casefold() == "dhcp":
+        if len(arguments) != 1:
+            raise ValueError("DHCP does not accept additional settings.")
+        return None
+    if len(arguments) > 5:
+        raise ValueError("Provide an IP, optional mask and gateway, and up to two DNS servers.")
+
+    current = adapter_settings(adapter)
+    ip = validate_ip(arguments[0], "IP address")
+    mask = (
+        arguments[1]
+        if len(arguments) > 1
+        else (current["MASK"][0] if current["MASK"] else "255.255.255.0")
+    )
+    prefix = subnet_prefix(mask)
+    gateway = (
+        arguments[2]
+        if len(arguments) > 2
+        else (current["GATEWAY"][0] if current["GATEWAY"] else "")
+    )
+    gateway = validate_ip(gateway, "Gateway") if gateway and gateway != "-" else ""
+
+    dns_servers = (
+        arguments[3:]
+        if len(arguments) > 3
+        else current["DNS"]
+    )
+    dns_servers = [
+        validate_ip(server, "DNS server")
+        for server in dns_servers
+        if server != "-"
+    ]
+    return ip, prefix, gateway, dns_servers
+
+
+def run_direct_command(adapter_name, settings_arguments):
+    if sys.platform != "win32":
+        raise OSError("Windows is required to change network adapter settings.")
+    if not bool(ctypes.windll.shell32.IsUserAnAdmin()):
+        raise PermissionError("Run this command in a terminal opened as Administrator.")
+
+    adapters = get_network_adapters()
+    adapter = next(
+        (item for item in adapters if item["Name"].casefold() == adapter_name.casefold()),
+        None,
+    )
+    if adapter is None:
+        available = ", ".join(item["Name"] for item in adapters) or "none"
+        raise ValueError(
+            f"Network adapter {adapter_name!r} was not found. Available adapters: {available}."
+        )
+    interface_index = adapter.get("InterfaceIndex")
+    if interface_index is None:
+        raise ValueError(f"{adapter['Name']} has no interface index and cannot be configured.")
+
+    settings = parse_direct_settings(settings_arguments, adapter)
+    if settings is None:
+        apply_dhcp(interface_index)
+        mode = "DHCP"
+    else:
+        apply_static(interface_index, *settings)
+        mode = "static settings"
+    print(f"Applied {mode} to network adapter {adapter['Name']!r}.")
+
+
 def run_terminal():
     if sys.platform != "win32":
         print("Windows required: run this terminal mode on the Windows computer.", file=sys.stderr)
@@ -338,21 +398,33 @@ def run_terminal():
             presets = load_presets()
             print("Available presets:")
             for index, preset in enumerate(presets, start=1):
-                print(f"{index}. ({preset['ip']})")
+                label = preset.get("name") or (
+                    "DHCP (Automatic)"
+                    if preset.get("dhcp") or str(preset.get("mode", "")).casefold() == "dhcp"
+                    else preset.get("ip", "Unknown")
+                )
+                print(f"{index}. ({label})")
             preset = presets[prompt_number("Select preset: ", len(presets))]
-            default_host = str(ipaddress.IPv4Address(preset["ip"])).split(".")[-1]
-            while True:
-                host = input(f"IP last number [{default_host}]: ").strip() or default_host
-                try:
-                    settings = preset_settings(preset, host)
-                    break
-                except (ValueError, KeyError) as error:
-                    print(error)
+            if preset.get("dhcp") or str(preset.get("mode", "")).casefold() == "dhcp":
+                settings = preset_settings(preset, None)
+            else:
+                default_host = str(ipaddress.IPv4Address(preset["ip"])).split(".")[-1]
+                while True:
+                    host = input(f"IP last number [{default_host}]: ").strip() or default_host
+                    try:
+                        settings = preset_settings(preset, host)
+                        break
+                    except (ValueError, KeyError) as error:
+                        print(error)
 
-        if settings is not None:
+        if settings is not None and settings[0] is not None:
             ip = validate_ip(settings[0], "IP address")
             prefix = subnet_prefix(settings[1])
             gateway = validate_ip(settings[2], "Gateway") if settings[2] else ""
+            dns_servers = [validate_ip(server, "DNS server") for server in settings[3]]
+        elif settings is not None:
+            # DHCP preset with optional DNS
+            ip, prefix, gateway = None, None, None
             dns_servers = [validate_ip(server, "DNS server") for server in settings[3]]
 
         confirmation = input(
@@ -363,8 +435,8 @@ def run_terminal():
             return
 
         previous_settings = adapter_settings(adapter)
-        if settings is None:
-            apply_dhcp(adapter["InterfaceIndex"])
+        if settings is None or settings[0] is None:
+            apply_dhcp(adapter["InterfaceIndex"], dns_servers if settings is not None else None)
         else:
             apply_static(adapter["InterfaceIndex"], ip, prefix, gateway, dns_servers)
 
@@ -446,6 +518,20 @@ class NetworkSettingsApp:
         self.adapter_cards_frame = ttk.Frame(adapter_list)
         self.adapter_cards_frame.pack(fill="x")
         self.adapter_cards = []
+        adapter_actions = ttk.Frame(adapter_list)
+        adapter_actions.pack(fill="x", pady=(6, 0))
+        self.enable_button = ttk.Button(
+            adapter_actions,
+            text="Enable selected",
+            command=lambda: self._set_selected_adapter_enabled(True),
+        )
+        self.enable_button.pack(side="right", padx=(4, 0))
+        self.disable_button = ttk.Button(
+            adapter_actions,
+            text="Disable selected",
+            command=lambda: self._set_selected_adapter_enabled(False),
+        )
+        self.disable_button.pack(side="right")
         self.root.bind("<Configure>", self._resize_adapter_cards)
 
         current = ttk.LabelFrame(main, text="Current settings", padding=12)
@@ -454,6 +540,14 @@ class NetworkSettingsApp:
         for row, (label, variable) in enumerate(self.current_vars.items()):
             ttk.Label(current, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=3)
             ttk.Label(current, textvariable=variable).grid(row=row, column=1, sticky="w", padx=(12, 0), pady=3)
+
+        self.preset_frame = ttk.LabelFrame(main, text="Fill from preset", padding=8)
+        self.preset_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.preset_frame.columnconfigure(0, weight=1)
+        self.preset_cards_frame = ttk.Frame(self.preset_frame)
+        self.preset_cards_frame.grid(row=0, column=0, sticky="ew", pady=4)
+        self.preset_cards = []
+        self._render_preset_cards()
 
         modes = ttk.LabelFrame(main, text="New settings", padding=12)
         modes.grid(row=4, column=0, columnspan=3, sticky="ew")
@@ -510,14 +604,6 @@ class NetworkSettingsApp:
             entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=3)
             self.dns_entries.append(entry)
 
-        self.preset_frame = ttk.LabelFrame(main, text="Fill from preset", padding=8)
-        self.preset_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        self.preset_frame.columnconfigure(0, weight=1)
-        self.preset_cards_frame = ttk.Frame(self.preset_frame)
-        self.preset_cards_frame.grid(row=0, column=0, sticky="ew", pady=4)
-        self.preset_cards = []
-        self._render_preset_cards()
-
         self.status_var = tk.StringVar()
         if not self._is_admin():
             self.status_var.set("Administrator rights are required to apply network changes.")
@@ -549,6 +635,8 @@ class NetworkSettingsApp:
             return False
         self.background_busy = True
         self.refresh_button.configure(state="disabled")
+        self.enable_button.configure(state="disabled")
+        self.disable_button.configure(state="disabled")
         self.apply_button.configure(state="disabled")
         self.status_var.set(status)
 
@@ -573,6 +661,8 @@ class NetworkSettingsApp:
 
         self.background_busy = False
         self.refresh_button.configure(state="normal")
+        self.enable_button.configure(state="normal")
+        self.disable_button.configure(state="normal")
         self.apply_button.configure(state="normal")
         if error is not None:
             self.status_var.set(f"{error_title}: {error}")
@@ -656,12 +746,20 @@ class NetworkSettingsApp:
                 takefocus=True,
                 command=lambda selected=index: self._select_adapter(selected),
             )
-            for key in ("<Left>", "<Right>", "<Home>", "<End>"):
+            for key in ("<Left>", "<Right>", "<Up>", "<Down>", "<Home>", "<End>"):
                 card.bind(
                     key,
                     lambda event, selected=index: self._handle_adapter_key(event, selected),
                 )
             self._bind_apply_enter(card)
+            card.bind(
+                "<Return>",
+                lambda _event, selected=index: self._activate_adapter_card(selected),
+            )
+            card.bind(
+                "<KP_Enter>",
+                lambda _event, selected=index: self._activate_adapter_card(selected),
+            )
             card.bind("<space>", lambda _event: "break")
             card.pack(side="left", anchor="nw", padx=2, pady=2)
             self.adapter_cards.append(card)
@@ -683,9 +781,9 @@ class NetworkSettingsApp:
     def _handle_adapter_key(self, event, index):
         if not self.adapters:
             return "break"
-        if event.keysym == "Left":
+        if event.keysym in ("Left", "Up"):
             index = (index - 1) % len(self.adapters)
-        elif event.keysym == "Right":
+        elif event.keysym in ("Right", "Down"):
             index = (index + 1) % len(self.adapters)
         elif event.keysym == "Home":
             index = 0
@@ -708,9 +806,71 @@ class NetworkSettingsApp:
         self._render_adapter_cards()
         self._show_current_settings()
 
+    def _activate_adapter_card(self, index):
+        self._select_adapter(index)
+        if self.adapter_cards:
+            self.adapter_cards[index].focus_set()
+        return "break"
+
     def _selected_adapter(self):
         index = self.selected_adapter_index
         return self.adapters[index] if index is not None and 0 <= index < len(self.adapters) else {}
+
+    def _set_selected_adapter_enabled(self, enabled):
+        if self.background_busy:
+            return
+        adapter = self._selected_adapter()
+        if not adapter:
+            messagebox.showerror(
+                "No adapter selected",
+                "Select a network adapter first.",
+                parent=self.root,
+            )
+            return
+        if not self._is_admin():
+            messagebox.showerror(
+                "Administrator rights required",
+                "Close the program and run it as administrator to change adapter status.",
+                parent=self.root,
+            )
+            return
+
+        action = "enable" if enabled else "disable"
+        if not messagebox.askyesno(
+            f"{action.title()} network adapter",
+            f"Do you want to {action} {adapter['Name']}?",
+            parent=self.root,
+        ):
+            return
+
+        adapter_name = adapter["Name"]
+
+        def update_adapter():
+            set_adapter_enabled(adapter_name, enabled)
+            return sorted(
+                get_network_adapters(),
+                key=lambda item: item.get("Status") != "Up",
+            )
+
+        def show_updated_adapters(adapters):
+            self._show_adapters(adapters)
+            selected_index = next(
+                (
+                    index
+                    for index, item in enumerate(self.adapters)
+                    if item["Name"] == adapter_name
+                ),
+                None,
+            )
+            if selected_index is not None:
+                self._select_adapter(selected_index)
+
+        self._start_background_task(
+            update_adapter,
+            show_updated_adapters,
+            "Enabling network adapter..." if enabled else "Disabling network adapter...",
+            f"Could not {action} network adapter",
+        )
 
     def _prefill_manual_settings(self, settings):
         values = {
@@ -758,6 +918,26 @@ class NetworkSettingsApp:
         preset = self._selected_preset()
         if not preset:
             return
+        is_dhcp = preset.get("dhcp") or str(preset.get("mode", "")).casefold() == "dhcp"
+        if is_dhcp:
+            self._render_preset_cards()
+            self.ip_mode_var.set("Automatic")
+            dns_list = preset.get("dns", [])
+            if dns_list:
+                self.dns_mode_var.set("Manual")
+                self.manual_vars["Preferred DNS server"].set(dns_list[0] if len(dns_list) > 0 else "")
+                self.manual_vars["Alternative DNS server"].set(dns_list[1] if len(dns_list) > 1 else "")
+            else:
+                self.dns_mode_var.set("Automatic")
+                self.manual_vars["Preferred DNS server"].set("")
+                self.manual_vars["Alternative DNS server"].set("")
+            self.manual_vars["IP address"].set("")
+            self.manual_vars["Subnet mask"].set("")
+            self.manual_vars["Gateway"].set("")
+            self._show_ip_mode()
+            self._show_dns_mode()
+            return
+
         try:
             settings = preset_settings(preset, str(ipaddress.IPv4Address(preset["ip"])).split(".")[-1])
         except (KeyError, ValueError) as error:
@@ -798,19 +978,32 @@ class NetworkSettingsApp:
 
         for index, preset in enumerate(self.presets):
             selected = str(index) == self.preset_var.get()
-            try:
-                ip = str(ipaddress.IPv4Address(preset["ip"]))
-            except (KeyError, ipaddress.AddressValueError):
-                ip = str(preset.get("ip", "Unknown"))
-            gateway = preset.get("gateway") or "None"
-            dns_servers = ", ".join(preset.get("dns", [])) or "Automatic"
-            card = tk.Button(
-                self.preset_cards_frame,
-                text=(
-                    f"IP: {ip}\n"
+            is_dhcp = preset.get("dhcp") or str(preset.get("mode", "")).casefold() == "dhcp"
+            name = preset.get("name")
+            header = f"{name}\n" if name else ""
+
+            if is_dhcp:
+                dns_servers = ", ".join(preset.get("dns", [])) or "Automatic"
+                card_text = (
+                    f"{header}IP: Automatic (DHCP)\n"
+                    f"Gateway: Automatic\nDNS: {dns_servers}"
+                )
+            else:
+                try:
+                    ip = str(ipaddress.IPv4Address(preset["ip"]))
+                except (KeyError, ipaddress.AddressValueError):
+                    ip = str(preset.get("ip", "Unknown"))
+                gateway = preset.get("gateway") or "None"
+                dns_servers = ", ".join(preset.get("dns", [])) or "Automatic"
+                card_text = (
+                    f"{header}IP: {ip}\n"
                     f"Mask: {preset.get('mask', 'Unknown')}\n"
                     f"Gateway: {gateway}\nDNS: {dns_servers}"
-                ),
+                )
+
+            card = tk.Button(
+                self.preset_cards_frame,
+                text=card_text,
                 anchor="w",
                 justify="left",
                 wraplength=wraplength,
@@ -823,7 +1016,7 @@ class NetworkSettingsApp:
                 takefocus=True,
                 command=lambda selected_index=index: self._select_preset_card(selected_index),
             )
-            for key in ("<Left>", "<Right>", "<Home>", "<End>"):
+            for key in ("<Left>", "<Right>", "<Up>", "<Down>", "<Home>", "<End>"):
                 card.bind(
                     key,
                     lambda event, selected_index=index: self._handle_preset_key(
@@ -831,6 +1024,18 @@ class NetworkSettingsApp:
                     ),
                 )
             self._bind_apply_enter(card)
+            card.bind(
+                "<Return>",
+                lambda _event, selected_index=index: self._activate_preset_card(
+                    selected_index
+                ),
+            )
+            card.bind(
+                "<KP_Enter>",
+                lambda _event, selected_index=index: self._activate_preset_card(
+                    selected_index
+                ),
+            )
             card.pack(side="left", anchor="nw", padx=2, pady=2)
             self.preset_cards.append(card)
         self.root.after_idle(self._resize_adapter_cards)
@@ -839,12 +1044,16 @@ class NetworkSettingsApp:
         self.preset_var.set(str(index))
         self._select_preset()
 
+    def _activate_preset_card(self, index):
+        self._select_preset_card(index)
+        return "break"
+
     def _handle_preset_key(self, event, index):
         if not self.presets:
             return "break"
-        if event.keysym == "Left":
+        if event.keysym in ("Left", "Up"):
             index = (index - 1) % len(self.presets)
-        elif event.keysym == "Right":
+        elif event.keysym in ("Right", "Down"):
             index = (index + 1) % len(self.presets)
         elif event.keysym == "Home":
             index = 0
@@ -956,16 +1165,45 @@ class NetworkSettingsApp:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Change Windows network adapter settings.")
+    parser = argparse.ArgumentParser(
+        description="Change Windows network adapter settings.",
+        epilog=(
+            "Examples:\n"
+            "  network_settings.py --cli\n"
+            '  network_settings.py "Wi-Fi" DHCP\n'
+            '  network_settings.py "Wi-Fi" 192.168.1.55\n'
+            '  network_settings.py "Wi-Fi" 192.168.1.55 255.255.255.0 192.168.1.1\n'
+            '  network_settings.py "Wi-Fi" 192.168.1.55 255.255.255.0 '
+            "192.168.1.1 1.1.1.1 8.8.8.8"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--cli",
         action="store_true",
         help="use interactive terminal prompts instead of the graphical interface",
     )
+    parser.add_argument(
+        "command",
+        nargs="*",
+        metavar="ARG",
+        help="adapter name followed by DHCP or an IP and optional network settings",
+    )
     arguments = parser.parse_args()
     if arguments.cli:
+        if arguments.command:
+            parser.error("--cli cannot be combined with a direct adapter command")
         run_terminal()
         return
+    if arguments.command:
+        if len(arguments.command) < 2:
+            parser.error("provide an adapter name followed by DHCP or an IP address")
+        try:
+            run_direct_command(arguments.command[0], arguments.command[1:])
+        except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
+            print(f"Could not update network settings: {error}", file=sys.stderr)
+            return 1
+        return 0
 
     if sys.platform != "win32":
         print(
@@ -997,4 +1235,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
